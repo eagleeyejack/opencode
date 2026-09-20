@@ -848,14 +848,38 @@ const layer = Layer.effect(
         requestInit: mcpConfig.headers ? { headers: mcpConfig.headers } : undefined,
       })
       const directory = yield* InstanceState.directory
+      // Keep the SDK module as a namespace object: the local `auth` binding is
+      // the McpAuth service, so destructuring the SDK `auth` function here
+      // would shadow it.
+      const sdkAuth = yield* Effect.promise(() => import("@modelcontextprotocol/sdk/client/auth.js"))
 
       return yield* Effect.tryPromise({
-        try: () => {
-          const client = createClient(directory)
-          return client.connect(transport).then(async () => {
-            await authProvider.commit()
-            return { authorizationUrl: "", oauthState, client } satisfies AuthResult
+        try: async () => {
+          // Start the SDK OAuth flow directly. The previous implementation
+          // relied on `client.connect()` throwing UnauthorizedError, which
+          // never happens when the server returns HTTP 200 for the handshake
+          // (e.g. Gmail MCP) and produced a false "connected" result.
+          const result = await sdkAuth.auth(authProvider, {
+            serverUrl: url.toString(),
+            scope: oauthConfig?.scope,
           })
+          if (result === "AUTHORIZED") {
+            // Do not report success without usable credentials: the SDK can
+            // return AUTHORIZED after a refresh, but a false 200 handshake
+            // must never be treated as authenticated without tokens.
+            const pendingTokens = await authProvider.tokens()
+            if (!pendingTokens?.access_token) throw new Error("OAuth flow completed without credentials")
+            // Commit before connecting so the fresh tokens survive even if
+            // the subsequent connect fails. No second commit is needed:
+            // connecting with fresh tokens saves nothing new.
+            await authProvider.commit()
+            const client = createClient(directory)
+            await client.connect(transport)
+            return { authorizationUrl: "", oauthState, client } satisfies AuthResult
+          }
+          if (!capturedUrl) throw new Error("OAuth flow did not produce an authorization URL")
+          pendingOAuthTransports.set(mcpName, { transport, provider: authProvider })
+          return { authorizationUrl: capturedUrl.toString(), oauthState } satisfies AuthResult
         },
         catch: (error) => error,
       }).pipe(
@@ -933,7 +957,14 @@ const layer = Layer.effect(
       if (error) return { status: "failed", error: `OAuth completion failed: ${error}` } satisfies Status
 
       yield* Effect.promise(() => pending.provider?.commit() ?? Promise.resolve())
+      // Do not report success unless usable credentials were actually persisted.
+      const persisted = yield* auth.get(mcpName)
+      if (!persisted?.tokens?.accessToken) {
+        pendingOAuthTransports.delete(mcpName)
+        return { status: "failed", error: "OAuth completion did not persist credentials" } satisfies Status
+      }
       yield* auth.clearCodeVerifier(mcpName)
+      yield* auth.clearOAuthState(mcpName)
       pendingOAuthTransports.delete(mcpName)
 
       const mcpConfig = yield* requireMcpConfig(mcpName)
